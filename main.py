@@ -38,7 +38,7 @@ if _deps:
         except Exception:
             pass
 
-from typing import Any, Dict, Iterable, List, Match, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Match, Optional, Tuple
 
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -1224,46 +1224,6 @@ def _extract_zip(zip_path: str, extract_to: str) -> bool:
         return False
 
 
-def _extract_nested_zips(root: str, max_depth: int = 3) -> Tuple[Set[str], List[str]]:
-    """递归解包 root 内的嵌套 zip：就地解压到 <zip名去扩展名>/ 子目录。
-
-    返回 (已成功解压的 zip 绝对路径集合, 解压失败的 zip 相对路径名单)。
-    深度上限 max_depth 防止恶意/异常的无限嵌套；按绝对路径去重防重复解包。
-    .7z/.rar 不解，仍由调用方的压缩包告警统一提示人工核对。
-    """
-    extracted: Set[str] = set()
-    failed: List[str] = []
-    frontier = [root]
-    for _depth in range(max_depth):
-        if not frontier:
-            break
-        next_frontier = []
-        for base in frontier:
-            for dirpath, _dirs, files in os.walk(base):
-                for f in files:
-                    if not f.lower().endswith('.zip'):
-                        continue
-                    zp = os.path.abspath(os.path.join(dirpath, f))
-                    if zp in extracted:
-                        continue
-                    dest = os.path.join(dirpath, os.path.splitext(f)[0])
-                    os.makedirs(dest, exist_ok=True)
-                    try:
-                        with zipfile.ZipFile(zp, 'r') as zf:
-                            _safe_extractall(zf, dest)
-                        extracted.add(zp)
-                        print(f"  嵌套解压: {os.path.relpath(zp, root)}")
-                        next_frontier.append(dest)
-                    # 嵌套包解压失败只记录名单（汇总告警），不阻断其他批次
-                    # noinspection PyBroadException
-                    except Exception as e:
-                        print(f"  ！嵌套压缩包解压失败: "
-                              f"{os.path.relpath(zp, root)} ({e})")
-                        failed.append(os.path.relpath(zp, root))
-        frontier = next_frontier
-    return extracted, failed
-
-
 # 需要忽略的临时/内部目录（自动解压残留、bench 测试等）
 _IGNORED_DIRS = frozenset([
     EXTRACTED_FOLDER, "_bench", "_bench2", "_bench_extract",
@@ -1348,16 +1308,8 @@ def _collect_report_batches() -> Tuple[List[Tuple[str, str, str]], str, List[str
                 bad_zips.append(zname)
                 continue
 
-        # 自动递归解包嵌套 zip（深度上限 3，就地解到 <zip名>/ 子目录），
-        # 解出的目录/文件随后按正常批次逻辑被收集，无需人工干预
-        nested_ok: Set[str] = set()
-        for zentry in sorted(os.listdir(extract_root)):
-            zfull = os.path.join(extract_root, zentry)
-            if not os.path.isdir(zfull):
-                continue
-            ok, bad = _extract_nested_zips(zfull)
-            nested_ok |= ok
-            bad_zips.extend(bad)
+        # 注意：嵌套压缩包（zip 内再含 zip/.7z/.rar）不自动递归解压，
+        # 解包后统一点名告警、直接略过（见下方 stray 扫描）。
 
         # 每个 zip 目录内：有子文件夹则按子文件夹分批；直接散文件则用 zip 名做批次名
         #（这些批次名先占坑，后面手动解压同名的会被跳过）
@@ -1372,21 +1324,17 @@ def _collect_report_batches() -> Tuple[List[Tuple[str, str, str]], str, List[str
             if not inner_dirs and _list_report_inputs(zfull, recursive=False):
                 add_batch(zfull, zentry)
 
-        # 已自动解包的嵌套 zip 不再告警；只点名 .7z/.rar 及超深度/解压失败的 zip，
-        # 这些程序不会自动解包，必须显式告警提醒人工核对份数
+        # 嵌套压缩包（顶层 zip 解出的内容里再出现的 zip/.7z/.rar）一律不自动解压、
+        # 直接略过，只点名位置提醒人工核对份数；extract_root 内的档案必然来自顶层 zip 解包
         stray = []
         for root, _dirs, files in os.walk(extract_root):
             for f in files:
-                low = f.lower()
-                if not low.endswith(('.zip', '.7z', '.rar')):
-                    continue
-                fp = os.path.abspath(os.path.join(root, f))
-                if low.endswith('.zip') and fp in nested_ok:
-                    continue
-                stray.append(os.path.relpath(fp, extract_root))
+                if f.lower().endswith(('.zip', '.7z', '.rar')):
+                    fp = os.path.abspath(os.path.join(root, f))
+                    stray.append(os.path.relpath(fp, extract_root))
         if stray:
-            print(f"  ！发现 {len(stray)} 个无法自动解包的压缩包"
-                  f"（.7z/.rar 或超嵌套深度/解压失败的 zip），请人工核对份数:")
+            print(f"  ！发现 {len(stray)} 个嵌套压缩包（程序不会自动解压，已全部略过；"
+                  f"如需其中报告请人工解压后重跑，并请核对份数）:")
             for a in sorted(stray):
                 print(f"      {a}")
 
@@ -1422,6 +1370,32 @@ def _cleanup_extracted(extract_root: str) -> None:
             print(f"已清理临时解压目录")
         except OSError as e:
             print(f"清理临时目录失败（不影响结果）: {e}")
+
+
+def _clean_output_folder() -> List[Tuple[str, OSError]]:
+    """每次运行生成前清空成品目录，防止上一批旧批次目录残留与本次成品混杂。
+
+    只删 OUTPUT_FOLDER 内的子项、不删目录本身（与 process_reports 开头
+    “确保成品根目录存在”的职责不重叠）；.gitkeep 占位文件保留。
+    返回删除失败的 (名称, 异常) 列表——Windows 上成品被 WPS/Word 打开时
+    会占用删不掉，调用方必须点名并中止运行：新旧混杂比不生成更危险。
+    """
+    failed: List[Tuple[str, OSError]] = []
+    if not os.path.isdir(OUTPUT_FOLDER):
+        os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+        return failed
+    for name in os.listdir(OUTPUT_FOLDER):
+        if name == '.gitkeep':
+            continue
+        path = os.path.join(OUTPUT_FOLDER, name)
+        try:
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path)
+            else:
+                os.remove(path)
+        except OSError as e:
+            failed.append((name, e))
+    return failed
 
 
 def _list_report_docx(folder: str, recursive: bool = False) -> List[str]:
@@ -1647,6 +1621,19 @@ def _process_body(log, tmp_path: str, final_box: List[str]) -> int:
     all_convert_failed = []         # [(批次名, 源文件相对路径), ...] 转换失败导致必缺份
 
     print(f"\n共识别出 {len(batches)} 个批次，正在收集任务...")
+
+    # 生成前清空上一批成品：批次已确认有效（batches 非空），旧批次目录再保留只会
+    # 与本次成品混杂（如上次放 6-8 月 zip、本次只放 3-5 月）。有成品被占用删不掉时
+    # 中止本次运行，避免新旧混杂交付
+    locked = _clean_output_folder()
+    if locked:
+        print(f"\n！清空“{OUTPUT_FOLDER}”失败：{len(locked)} 个旧项目被占用"
+              f"（很可能正在 WPS/Word 中打开），请全部关闭后重跑：")
+        for name, err in locked:
+            print(f"      {name}（{err}）")
+        _cleanup_extracted(extract_root)
+        return 1
+    print(f"已清空“{OUTPUT_FOLDER}”中的上次成品（.gitkeep 保留）")
 
     for src, out, name in batches:
         # 根目录散文件批次只收直接层文件：递归会把 zip 解压内容和子文件夹整树重复生成

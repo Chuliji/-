@@ -56,6 +56,7 @@ import multiprocessing
 import html
 import math
 import random
+from collections import Counter
 
 # 文本索引表：(扁平单元格文本列表, 列数, 行数)
 GridTbl = Tuple[List[str], int, int]
@@ -761,46 +762,6 @@ def _safe_extractall(zf: zipfile.ZipFile, dest: str) -> None:
             shutil.copyfileobj(src_f, out_f)
 
 
-def _extract_nested_zips(root: str, max_depth: int = 3) -> Tuple[Set[str], List[str]]:
-    """递归解包 root 内的嵌套 zip：就地解压到 <zip名去扩展名>/ 子目录。
-
-    返回 (已成功解压的 zip 绝对路径集合, 解压失败的 zip 相对路径名单)。
-    深度上限 max_depth 防止恶意/异常的无限嵌套；按绝对路径去重防重复解包。
-    .7z/.rar 不解，仍由调用方的压缩包告警统一提示人工核对。
-    """
-    extracted: Set[str] = set()
-    failed: List[str] = []
-    frontier = [root]
-    for _depth in range(max_depth):
-        if not frontier:
-            break
-        next_frontier = []
-        for base in frontier:
-            for dirpath, _dirs, files in os.walk(base):
-                for f in files:
-                    if not f.lower().endswith('.zip'):
-                        continue
-                    zp = os.path.abspath(os.path.join(dirpath, f))
-                    if zp in extracted:
-                        continue
-                    dest = os.path.join(dirpath, os.path.splitext(f)[0])
-                    os.makedirs(dest, exist_ok=True)
-                    try:
-                        with zipfile.ZipFile(zp, 'r') as zf:
-                            _safe_extractall(zf, dest)
-                        extracted.add(zp)
-                        print(f"  嵌套解压: {os.path.relpath(zp, root)}")
-                        next_frontier.append(dest)
-                    # 嵌套包解压失败只记录名单（汇总告警），不阻断其他批次
-                    # noinspection PyBroadException
-                    except Exception as e:
-                        print(f"  ！嵌套压缩包解压失败: "
-                              f"{os.path.relpath(zp, root)} ({e})")
-                        failed.append(os.path.relpath(zp, root))
-        frontier = next_frontier
-    return extracted, failed
-
-
 def _ensure_extracted(report_folder: str,
                       extract_tag: str = "_已解压_check") -> Tuple[Optional[str], List[str]]:
     """扫描 zip 并解压，返回 (解压后根目录或None, 损坏zip名单)。
@@ -849,32 +810,18 @@ def _ensure_extracted(report_folder: str,
             print(f"  解压失败 {zname}: {e}")
             failed.append(zname)
 
-    # 自动递归解包嵌套 zip（深度上限 3），与 main 口径一致；
-    # 嵌套包解压失败 = 源数据不完整，必须计入 failed 让调用方 fail-closed
-    nested_ok: Set[str] = set()
-    for zentry in sorted(os.listdir(extract_root)):
-        zfull = os.path.join(extract_root, zentry)
-        if not os.path.isdir(zfull):
-            continue
-        ok, bad = _extract_nested_zips(zfull)
-        nested_ok |= ok
-        failed.extend(bad)
-
-    # 已自动解包的嵌套 zip 不再告警；只点名 .7z/.rar 及超深度/解压失败的 zip，
-    # 这些源数据可能不完整，必须显式告警提醒人工核对份数
+    # 嵌套压缩包（顶层 zip 解出的内容里再出现的 zip/.7z/.rar）与 main 同口径：
+    # 不自动递归解压、直接略过，只点名位置提醒人工核对份数；
+    # 嵌套包不是“解压失败”，不计入 failed（main 同样不生成其中报告，比对口径一致）
     stray = []
     for root, _dirs, files in os.walk(extract_root):
         for f in files:
-            low = f.lower()
-            if not low.endswith(('.zip', '.7z', '.rar')):
-                continue
-            fp = os.path.abspath(os.path.join(root, f))
-            if low.endswith('.zip') and fp in nested_ok:
-                continue
-            stray.append(os.path.relpath(fp, extract_root))
+            if f.lower().endswith(('.zip', '.7z', '.rar')):
+                fp = os.path.abspath(os.path.join(root, f))
+                stray.append(os.path.relpath(fp, extract_root))
     if stray:
-        print(f"  ！发现 {len(stray)} 个无法自动解包的压缩包"
-              f"（.7z/.rar 或超嵌套深度/解压失败的 zip），请人工核对份数:")
+        print(f"  ！发现 {len(stray)} 个嵌套压缩包（程序不会自动解压，已全部略过；"
+              f"如需其中报告请人工解压后重跑，并请核对份数）:")
         for a in sorted(stray):
             print(f"      {a}")
     return extract_root, failed
@@ -949,12 +896,16 @@ def _prune_ignored_dirs(dirs: List[str]) -> None:
                and d not in ('__pycache__', '原始记录汇总')]
 
 
-def _match_key(filename: str) -> str:
-    """把源/成品文件名归一化为「报告编号+号牌」匹配键。
+# 报告编号（成品名与源文件名共有的稳定主键；号牌不参与匹配）
+_REPORT_NUM_RE = re.compile(r"B-[A-Za-z0-9]+")
+
+
+def _full_stem_key(filename: str) -> str:
+    """旧口径匹配键：剥离尾词后的「编号+号牌」完整串。
 
     成品命名规则（main.py）：报告编号+号牌+原始记录.docx；
     历史源文件名尾部可能带「检验报告」「报告」，还可能有「 - 副本」或多余空格。
-    剥离这些尾部词后，源与成品按同一个键匹配，不再依赖完整文件名是否一致。
+    仅用于同编号多候选时的二次精确筛选，不再作为跨源/成品的主匹配键。
     """
     stem = os.path.splitext(os.path.basename(filename))[0]
     stem = re.sub(r'\s*-\s*副本\s*$', '', stem)
@@ -964,6 +915,52 @@ def _match_key(filename: str) -> str:
         prev = stem
         stem = re.sub(r'(?:原始记录|检验报告|报告)\s*$', '', stem)
     return stem.strip()
+
+
+def _match_key(filename: str) -> str:
+    """把源/成品文件名归一化为匹配键：优先取报告编号（B-...）。
+
+    成品名取的是报告文档内的「报告编号+机动车号牌」，而源 zip 文件名由人工
+    命名，号牌常有笔误（漏字/多字/形近字）、简繁混用（粤/粵）、副本尾号
+    （检验报告 2 / (1) / - 副本）——用「编号+号牌」整串匹配会把同一份报告
+    误判成“源有成品缺/成品有源缺”。报告编号是双方共有的稳定主键，故只取
+    编号；提取不到编号的异常命名回退为完整 stem 键，照样被点名、不漏报。
+    """
+    m = _REPORT_NUM_RE.search(os.path.basename(filename))
+    if m:
+        return m.group(0)
+    return _full_stem_key(filename)
+
+
+def _pick_source_report(candidates: List[str], output_path: str):
+    """从同编号候选源报告中挑出唯一匹配，返回路径；无候选返回 ""，多份歧义返回 None。
+
+    筛选顺序（fail-closed，宁可报歧义也不猜）：
+      1. 转换产物 .docx 优先：.wps/.doc 转换后与原件同编号并存，只认 docx，
+         消除“同一份报告因原件+转换件并存而误报多份同名”的假歧义；
+      2. 「编号+号牌」完整键与成品一致的优先：同编号重号（如两份报告共用一个
+         编号、号牌不同）时各自精确命中，不交叉乱配；
+      3. 物理路径去重后恰好 1 份才采用；0 份=找不到源；≥2 份=歧义交人工核对。
+    """
+    if not candidates:
+        return ""
+    docx = [p for p in candidates if p.lower().endswith(".docx")]
+    pool = docx if docx else list(candidates)
+    target_full = _full_stem_key(output_path)
+    exact = [p for p in pool if _full_stem_key(p) == target_full]
+    if exact:
+        pool = exact
+    uniq, seen = [], set()
+    for p in pool:
+        rp = os.path.normcase(os.path.abspath(p))
+        if rp not in seen:
+            seen.add(rp)
+            uniq.append(p)
+    if len(uniq) == 1:
+        return uniq[0]
+    if not uniq:
+        return ""
+    return None
 
 
 def _build_report_index(*roots: str) -> Dict[str, List[str]]:
@@ -1000,23 +997,44 @@ def _is_report_input_name(filename: str) -> bool:
     return filename.lower().endswith((".docx", ".doc", ".wps", ".docm"))
 
 
-def _direct_report_stems(dirpath: str) -> Set[str]:
-    """目录直接层报告的「编号+号牌」匹配键集合（不下钻）。"""
+def _direct_report_stems(dirpath: str) -> Counter:
+    """目录直接层报告的编号匹配键计数（不下钻）：同编号多份副本也要逐份计数。
+
+    盘点在 .wps/.doc 转 .docx 之后进行：同目录的“x.wps + x.docx”是同一份的
+    原件与转换件，按同目录同基名折叠为 1 份；不同子目录的同名文件不折叠。
+    """
+    stems = Counter()
     try:
-        return {_match_key(f) for f in os.listdir(dirpath)
-                if os.path.isfile(os.path.join(dirpath, f)) and _is_report_input_name(f)}
+        names = os.listdir(dirpath)
     except OSError:
-        return set()
+        return stems
+    seen_bases = set()
+    for f in names:
+        if not (os.path.isfile(os.path.join(dirpath, f)) and _is_report_input_name(f)):
+            continue
+        base_key = os.path.normcase(os.path.join(dirpath, os.path.splitext(f)[0]))
+        if base_key in seen_bases:
+            continue
+        seen_bases.add(base_key)
+        stems[_match_key(f)] += 1
+    return stems
 
 
-def _recursive_report_stems(dirpath: str) -> Set[str]:
-    """目录整树报告的「编号+号牌」匹配键集合（剪枝忽略目录）。"""
-    stems = set()
+def _recursive_report_stems(dirpath: str) -> Counter:
+    """目录整树报告的编号匹配键计数（剪枝忽略目录）：同编号多份副本逐份计数，
+    同目录的原件+转换件（x.wps/x.docx）折叠为 1 份。"""
+    stems = Counter()
     for r, dirs, files in os.walk(dirpath):
         _prune_ignored_dirs(dirs)
+        seen_bases = set()
         for f in files:
-            if _is_report_input_name(f):
-                stems.add(_match_key(f))
+            if not _is_report_input_name(f):
+                continue
+            base_key = os.path.normcase(os.path.join(r, os.path.splitext(f)[0]))
+            if base_key in seen_bases:
+                continue
+            seen_bases.add(base_key)
+            stems[_match_key(f)] += 1
     return stems
 
 
@@ -1031,10 +1049,11 @@ def _visible_subdirs(dirpath: str) -> List[str]:
         return []
 
 
-def _scan_source_batches(root: str) -> Dict[str, Set[str]]:
+def _scan_source_batches(root: str) -> Dict[str, Counter]:
     """检验报告文件夹口径（与 main 方式2/3 完全一致）：
     root 直接层散文件 → 批次名 = root 目录名（仅直接层）；
     每个直接子目录 → 各自递归归并为一个批次（批次名 = 子目录名，含更深层文件）。
+    值为 编号->份数 计数（同编号副本逐份计数，不被集合去重吞掉）。
     """
     batches = {}
     if not root or not os.path.isdir(root):
@@ -1045,11 +1064,11 @@ def _scan_source_batches(root: str) -> Dict[str, Set[str]]:
     for d in _visible_subdirs(root):
         stems = _recursive_report_stems(os.path.join(root, d))
         if stems:
-            batches.setdefault(d, set()).update(stems)
+            batches.setdefault(d, Counter()).update(stems)
     return batches
 
 
-def _scan_zip_batches(extract_root: str) -> Dict[str, Set[str]]:
+def _scan_zip_batches(extract_root: str) -> Dict[str, Counter]:
     """zip 解压目录口径（与 main 方式1 完全一致）：
     每个 zipstem 的内层目录各自递归归并为一个批次；
     zipstem 无内层目录时其直接层散文件为 zipstem 名批次；
@@ -1066,17 +1085,17 @@ def _scan_zip_batches(extract_root: str) -> Dict[str, Set[str]]:
             for d in inner:
                 stems = _recursive_report_stems(os.path.join(zfull, d))
                 if stems:
-                    batches.setdefault(d, set()).update(stems)
+                    batches.setdefault(d, Counter()).update(stems)
         # 无论有无内层目录，zipstem 直接层散文件都单列（main 只在无内层目录时才收它们；
         # 有内层目录时 main 丢弃这些散文件，这里单列后盘点会报"源有、成品缺失"）
         direct = _direct_report_stems(zfull)
         if direct:
-            batches.setdefault(z, set()).update(direct)
+            batches.setdefault(z, Counter()).update(direct)
     return batches
 
 
-def _scan_output_batches(output_folder: str) -> Dict[str, Set[str]]:
-    """扫描成品目录，返回 {批次名: set(成品stem)}。成品目录名以“原始记录”结尾。"""
+def _scan_output_batches(output_folder: str) -> Dict[str, Counter]:
+    """扫描成品目录，返回 {批次名: Counter(编号->份数)}。目录名以“原始记录”结尾。"""
     batches = {}
     if not os.path.isdir(output_folder):
         return batches
@@ -1085,41 +1104,50 @@ def _scan_output_batches(output_folder: str) -> Dict[str, Set[str]]:
         if not (os.path.isdir(full) and d.endswith("原始记录")):
             continue
         name = d[:-4]
-        stems = set()
+        stems = Counter()
         for root, _d, files in os.walk(full):
             for f in files:
                 if f.lower().endswith(".docx") and not f.startswith("~$"):
-                    # 统一归一化为「编号+号牌」匹配键，与源侧口径一致
-                    stems.add(_match_key(f))
+                    # 按报告编号计数，与源侧口径一致（号牌写法差异不影响对账）
+                    stems[_match_key(f)] += 1
         batches[name] = stems
     return batches
 
 
-def _reconcile_batches(src_maps: Iterable[Dict[str, Set[str]]],
+def _reconcile_batches(src_maps: Iterable[Dict[str, Counter]],
                        output_folder: str) -> List[str]:
-    """批次级双向盘点：源↔成品的批次与文件必须一一对应，任一缺失逐条列出。
+    """批次级双向盘点：源↔成品的批次与编号份数必须一一对应，任一缺失逐条列出。
 
-    入参为多张源侧批次表（检验报告文件夹口径 + zip 解压目录口径），先合并再比对。
+    入参为多张源侧批次表（检验报告文件夹口径 + zip 解压目录口径），按编号计数
+    相加合并后与成品比对：号牌笔误/简繁/副本尾号造成的文件名差异不再误报，
+    但“同编号份数不一致”（源重复提交、成品重号覆盖等）仍会逐编号点名。
     """
-    src: Dict[str, Set[str]] = {}
+    src: Dict[str, Counter] = {}
     for m in src_maps:
         for k, v in m.items():
-            src.setdefault(k, set()).update(v)
+            src.setdefault(k, Counter()).update(v)
     out = _scan_output_batches(output_folder)
 
     issues = []
     for name in sorted(set(src) | set(out)):
         s, o = src.get(name), out.get(name)
         if s is None:
-            issues.append("批次「%s」：成品有 %d 份，但无源批次目录" % (name, len(o)))
+            issues.append("批次「%s」：成品有 %d 份，但无源批次目录" % (name, sum(o.values())))
             continue
         if o is None:
-            issues.append("批次「%s」：源有 %d 份，但无成品目录" % (name, len(s)))
+            issues.append("批次「%s」：源有 %d 份，但无成品目录" % (name, sum(s.values())))
             continue
-        for f in sorted(s - o):
-            issues.append("批次「%s」：源报告有、成品缺失：%s" % (name, f))
-        for f in sorted(o - s):
-            issues.append("批次「%s」：成品有、源缺失：%s" % (name, f))
+        for key in sorted(set(s) | set(o)):
+            cs, co = s.get(key, 0), o.get(key, 0)
+            if cs and not co:
+                issues.append("批次「%s」：源报告有 %d 份、成品缺失：%s"
+                              % (name, cs, key))
+            elif co and not cs:
+                issues.append("批次「%s」：成品有 %d 份、源缺失：%s"
+                              % (name, co, key))
+            elif cs != co:
+                issues.append("批次「%s」：%s 份数不一致（源 %d 份 / 成品 %d 份，"
+                              "请核对是否重复提交或重号覆盖）" % (name, key, cs, co))
     return issues
 
 
@@ -1202,14 +1230,14 @@ def _check_one(task: Tuple[str, str, Optional[str]]) -> Tuple[str, str, int, Lis
     返回 (rel_path, status, 异常数, 明细行列表)；status ∈ {'ok','notfound','error'}
     """
     output_path, rel_path, report_path = task
-    report_key = _match_key(output_path)
+    report_key = _full_stem_key(output_path)
 
     if report_path is None:
         return (rel_path, "error", 1,
-                ["  匹配到多份同名检验报告，无法唯一确定（请人工核对批次目录）"])
+                ["  同报告编号匹配到多份检验报告，无法唯一确定（请人工核对批次目录）"])
     if not report_path:
         return (rel_path, "notfound", 1,
-                ["  未找到对应的检验报告 [%s]，已跳过" % report_key])
+                ["  未找到同报告编号的检验报告 [%s]，已跳过" % report_key])
     try:
         report_data = extract_report(report_path)
         output_data = extract_output(output_path)
@@ -1531,8 +1559,7 @@ def _generate_sample_review(output_folder: str, report_index: Dict[str, List[str
         picks = rng.sample(outs, min(n, len(outs)))
         picks.sort()
         for op in picks:
-            candidates = report_index.get(_match_key(op)) or []
-            src = candidates[0] if len(candidates) == 1 else None
+            src = _pick_source_report(report_index.get(_match_key(op)), op)
             sampled.append((batch, op, src, "c%d" % seq))
             seq += 1
 
@@ -1642,13 +1669,9 @@ def _run(log, tmp_path: str, final_box: List[str]) -> int:
     tasks = []
     for output_path in output_entries:
         rel_path = os.path.relpath(output_path, output_folder)
-        candidates = report_index.get(_match_key(output_path))
-        if not candidates:
-            report_path = ""          # 找不到源
-        elif len(candidates) == 1:
-            report_path = candidates[0]
-        else:
-            report_path = None        # 同名歧义：fail-closed，不猜
+        # 按报告编号配对：号牌笔误/简繁/副本尾号不影响；同编号多份交人工核对
+        report_path = _pick_source_report(
+            report_index.get(_match_key(output_path)), output_path)
         tasks.append((output_path, rel_path, report_path))
 
     def _consume(result):

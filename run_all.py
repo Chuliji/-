@@ -27,14 +27,31 @@ import os
 _LOCAL_FLAGS = {"--skip-check", "--skip-verify", "--full-text"}
 
 
-def _run_step(name: str, cmd: list) -> int:
+def _run_step(name: str, cmd: list, extra_env: dict = None) -> int:
     """运行一个子步骤，实时透传输出，返回退出码。"""
     print("\n" + "=" * 60)
     print(f"  开始执行: {name}")
     print(f"  命令: {' '.join(cmd)}")
     print("=" * 60 + "\n")
-    # 继承父进程 stdout/stderr，实时显示输出；cwd 固定为项目根目录
-    result = subprocess.run(cmd, cwd=os.path.dirname(os.path.abspath(__file__)))
+    # 显式传递标准句柄（不能依赖默认继承）：
+    # Windows 上当父进程是 pythonw.exe（无控制台，如 GUI 经 QProcess 启动本脚本）时，
+    # subprocess.run 默认 close_fds=True，若此处不显式传 stdio，孙进程 check.py/verify.py
+    # 的标准句柄会是 None，导致其第一次 print 即 AttributeError、静默退出（退出码 1，
+    # 且留下 0 字节 _pending 日志）。显式传入父进程 stdio 后，子进程经 DuplicateHandle
+    # 拿到有效管道句柄，输出可实时透传到 GUI；父进程 stdio 为 None 时退化为 DEVNULL，
+    # 业务输出仍完整写入各自的日志文件，不会崩溃。
+    cwd = os.path.dirname(os.path.abspath(__file__))
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
+    result = subprocess.run(
+        cmd,
+        cwd=cwd,
+        env=env,
+        stdin=sys.stdin if sys.stdin is not None else subprocess.DEVNULL,
+        stdout=sys.stdout if sys.stdout is not None else subprocess.DEVNULL,
+        stderr=sys.stderr if sys.stderr is not None else subprocess.DEVNULL,
+    )
     code = result.returncode
     status = "通过" if code == 0 else f"失败（退出码 {code}）"
     print(f"\n  {name} 结束: {status}")
@@ -54,11 +71,19 @@ def main() -> int:
     results = {}
     py = sys.executable
 
+    # 两个环节都执行时，让 check 解压一次、verify 直接复用，避免同一批 zip 解压两遍
+    # （约省一半磁盘 IO 与一个 140MB 临时目录）。单独执行任一环节则不启用，各自独立解压清理。
+    share_extract = (not skip_check) and (not skip_verify)
+    shared_tag = "_已解压_runall"
+    producer_env = {"RAWREC_EXTRACT_TAG": shared_tag, "RAWREC_EXTRACT_ROLE": "producer"}
+    reuser_env = {"RAWREC_EXTRACT_TAG": shared_tag, "RAWREC_EXTRACT_ROLE": "reuser"}
+
     # ---- 1. check.py 异构校验 ----
     if skip_check:
         print("[跳过] check.py（--skip-check）")
     else:
-        code = _run_step("check.py 异构校验", [py, "check.py"])
+        code = _run_step("check.py 异构校验", [py, "check.py"],
+                         extra_env=producer_env if share_extract else None)
         results["check"] = code
         # check 失败不停止，继续 verify（渲染问题与数据问题可能独立存在）
 
@@ -70,7 +95,8 @@ def main() -> int:
         if full_text:
             verify_cmd.append("--full-text")
         verify_cmd.extend(passthrough)
-        code = _run_step("verify.py 渲染闸门", verify_cmd)
+        code = _run_step("verify.py 渲染闸门", verify_cmd,
+                         extra_env=reuser_env if share_extract else None)
         results["verify"] = code
 
     # ---- 汇总 ----
